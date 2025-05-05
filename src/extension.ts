@@ -1,427 +1,254 @@
 import * as vscode from 'vscode';
 
+interface TagMatch {
+    index: number;
+    tag: string;
+}
+
+interface TagResult {
+    tagName?: string;
+    message?: string;
+}
+
 export function activate(context: vscode.ExtensionContext) {
-    console.log('XML Helper extension activated');
+    console.log('XML Epsilon Tag Closer is now active!');
 
-    // Get configuration
-    const config = vscode.workspace.getConfiguration('xmlHelper');
-    let customTemplates = config.get<{name: string, content: string}[]>('templates', []);
-
-    // Register close tag command
-    const closeTagDisposable = vscode.commands.registerCommand('xmlHelper.closeCurrentTag', () => {
+    let disposable = vscode.commands.registerCommand('epsilon-tag-closer.closeEpsilonTag', function () {
         const editor = vscode.window.activeTextEditor;
         if (!editor) {
-            vscode.window.showErrorMessage('No active editor');
             return;
+        }
+
+        // Only activate in XML and HTML file types
+        const languageId = editor.document.languageId;
+        if (!['xml', 'html', 'xhtml', 'svg', 'xaml'].includes(languageId)) {
+            // Still allow it to work in any file if the user manually invokes it
+            const proceed = true;
+            if (!proceed) {
+                vscode.window.showInformationMessage('Epsilon Tag Closer is optimized for XML/HTML files.');
+                return;
+            }
         }
 
         const document = editor.document;
-        const position = editor.selection.active;
-        const fullText = document.getText();
-        const cursorPos = document.offsetAt(position);
-
-        // Find all tags in the document
-        // FIXED: Added underscore character to the allowed tag name characters
-        const tagRegex = /<(\/?)([a-zA-Z][a-zA-Z0-9:_-]*)(?:\s+[^>]*?)?>/g;
+        const selection = editor.selection;
         
-        const stack: {name: string, pos: number}[] = [];
-        const allTags: {name: string, pos: number, isClosing: boolean, isSelfClosing: boolean}[] = [];
+        // Get the current position
+        const position = selection.active;
         
-        // First pass: collect all tags and their positions
-        let match;
-        tagRegex.lastIndex = 0; // Reset regex lastIndex
-        while ((match = tagRegex.exec(fullText)) !== null) {
-            const isClosing = match[1] === '/';
-            const isSelfClosing = !isClosing && match[0].endsWith('/>');
-            allTags.push({
-                name: match[2],
-                pos: match.index,
-                isClosing,
-                isSelfClosing
-            });
-        }
-
-        // Second pass: determine which tags are unclosed at cursor position
-        const tagsBeforeCursor = allTags.filter(tag => tag.pos < cursorPos);
-        const tagsAfterCursor = allTags.filter(tag => tag.pos >= cursorPos);
+        // Get the entire document text
+        const documentText = document.getText();
         
-        // Build the stack of unclosed tags before cursor
-        for (const tag of tagsBeforeCursor) {
-            if (tag.isSelfClosing) {
-                continue; // Skip self-closing tags
-            }
-
-            if (tag.isClosing) {
-                // For closing tags, find matching opening tag in stack
-                let matchingIndex = -1;
-                for (let i = stack.length - 1; i >= 0; i--) {
-                    if (stack[i].name === tag.name) {
-                        matchingIndex = i;
-                        break;
-                    }
-                }
-                if (matchingIndex >= 0) {
-                    stack.splice(matchingIndex, 1);
-                }
-            } else {
-                // For opening tags, add to stack
-                stack.push({name: tag.name, pos: tag.pos});
-            }
-        }
-
-        // Check if cursor is inside a closing tag
-        const lineText = document.lineAt(position.line).text;
-        const cursorPosInLine = position.character;
-        const textBeforeCursor = lineText.substring(0, cursorPosInLine);
-        // FIXED: Added underscore character to the allowed tag name characters
-        if (/<\/([a-zA-Z][a-zA-Z0-9:_-]*)$/.test(textBeforeCursor)) {
-            vscode.window.showInformationMessage('Cursor is inside a closing tag');
-            return;
-        }
-
-        // If we have no unclosed tags, nothing to do
-        if (stack.length === 0) {
-            vscode.window.showInformationMessage('No unclosed tags found');
-            return;
-        }
-
-        // Find the first tag we need to close by working backward from the most recently opened tag
-        let tagToClose: string | null = null;
+        // Get the text up to the current position
+        const textBeforeCursor = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
         
-        for (let i = stack.length - 1; i >= 0; i--) {
-            const tag = stack[i];
-            const tagName = tag.name;
-            
-            // Check if this tag is already properly closed after cursor
-            let isProperlyClosed = false;
-            let nestedTagsToClose = 0;
-            
-            for (const t of tagsAfterCursor) {
-                if (!t.isClosing && t.name === tagName && !t.isSelfClosing) {
-                    nestedTagsToClose++;
-                    continue;
-                }
-                
-                if (t.isClosing && t.name === tagName) {
-                    if (nestedTagsToClose > 0) {
-                        nestedTagsToClose--;
-                    } else {
-                        isProperlyClosed = true;
-                        break;
-                    }
-                }
-            }
-            
-            if (!isProperlyClosed) {
-                tagToClose = tagName;
-                break;
-            }
-        }
+        // Find the last opened epsilon tag
+        const result = findLastOpenedEpsilonTag(textBeforeCursor, documentText);
+        console.log("Detected unclosed tag:");
 
-        // If we've exhausted the stack and didn't find a tag to close,
-        // it means all tags are properly closed
-        if (!tagToClose) {
-            vscode.window.showInformationMessage('All tags are properly closed');
-            return;
-        }
+        // Fix: Check if tagName exists before using it
+        if (result.tagName !== undefined) {
+            console.log("Detected unclosed tag:", result.tagName);
+            console.log("Insert position:", position.line, position.character);
 
-        // Insert closing tag
-        const closingTag = `</${tagToClose}>`;
-        editor.edit(editBuilder => {
-            editBuilder.insert(position, closingTag);
-        });
-        
-        vscode.window.showInformationMessage(`Closed tag: <${tagToClose}>`);
-    });
-
-    // Register the command to close all unclosed tags
-    const closeAllTagsDisposable = vscode.commands.registerCommand('xmlHelper.closeAllTags', () => {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) {
-            vscode.window.showErrorMessage('No active editor');
-            return;
-        }
-
-        const document = editor.document;
-        const position = editor.selection.active;
-        const fullText = document.getText();
-        const cursorPos = document.offsetAt(position);
-
-        // Find all tags in the document
-        // FIXED: Added underscore character to the allowed tag name characters
-        const tagRegex = /<(\/?)([a-zA-Z][a-zA-Z0-9:_-]*)(?:\s+[^>]*?)?>/g;
-        
-        const stack: {name: string, pos: number}[] = [];
-        const allTags: {name: string, pos: number, isClosing: boolean, isSelfClosing: boolean}[] = [];
-        
-        // First pass: collect all tags and their positions
-        let match;
-        tagRegex.lastIndex = 0; // Reset regex lastIndex
-        while ((match = tagRegex.exec(fullText)) !== null) {
-            const isClosing = match[1] === '/';
-            const isSelfClosing = !isClosing && match[0].endsWith('/>');
-            allTags.push({
-                name: match[2],
-                pos: match.index,
-                isClosing,
-                isSelfClosing
-            });
-        }
-
-        // Second pass: determine which tags are unclosed at cursor position
-        const tagsBeforeCursor = allTags.filter(tag => tag.pos < cursorPos);
-        
-        // Build the stack of unclosed tags before cursor
-        for (const tag of tagsBeforeCursor) {
-            if (tag.isSelfClosing) {
-                continue; // Skip self-closing tags
-            }
-
-            if (tag.isClosing) {
-                // For closing tags, find matching opening tag in stack
-                let matchingIndex = -1;
-                for (let i = stack.length - 1; i >= 0; i--) {
-                    if (stack[i].name === tag.name) {
-                        matchingIndex = i;
-                        break;
-                    }
-                }
-                if (matchingIndex >= 0) {
-                    stack.splice(matchingIndex, 1);
-                }
-            } else {
-                // For opening tags, add to stack
-                stack.push({name: tag.name, pos: tag.pos});
-            }
-        }
-
-        // Check if cursor is inside a closing tag
-        const lineText = document.lineAt(position.line).text;
-        const cursorPosInLine = position.character;
-        const textBeforeCursor = lineText.substring(0, cursorPosInLine);
-        // FIXED: Added underscore character to the allowed tag name characters
-        if (/<\/([a-zA-Z][a-zA-Z0-9:_-]*)$/.test(textBeforeCursor)) {
-            vscode.window.showInformationMessage('Cursor is inside a closing tag');
-            return;
-        }
-
-        // If we have no unclosed tags, nothing to do
-        if (stack.length === 0) {
-            vscode.window.showInformationMessage('No unclosed tags found');
-            return;
-        }
-
-        // Build the closing tags string, starting from the most recently opened tag
-        let closingTagsString = '';
-        for (let i = stack.length - 1; i >= 0; i--) {
-            closingTagsString += `</${stack[i].name}>`;
-        }
-
-        // Insert all closing tags
-        editor.edit(editBuilder => {
-            editBuilder.insert(position, closingTagsString);
-        });
-        
-        vscode.window.showInformationMessage(`Closed ${stack.length} tags`);
-    });
-
-    // Register format XML command
-    const formatXmlDisposable = vscode.commands.registerCommand('xmlHelper.formatXml', () => {
-        const editor = vscode.window.activeTextEditor;
-        if (!editor) {
-            vscode.window.showErrorMessage('No active editor');
-            return;
-        }
-
-        try {
-            const document = editor.document;
-            const text = document.getText();
-            
-            // Simple XML formatting function
-            const formatted = formatXml(text);
-            
-            // Replace the entire document with formatted XML
-            const fullRange = new vscode.Range(
-                document.positionAt(0),
-                document.positionAt(text.length)
-            );
-            
+            const tagName = result.tagName; // TypeScript now knows it's defined
             editor.edit(editBuilder => {
-                editBuilder.replace(fullRange, formatted);
+                editBuilder.insert(position, `</${tagName}>`);
+            }).then(success => {
+                if (success) {
+                    const newPosition = new vscode.Position(
+                        position.line,
+                        position.character + tagName.length + 3 // "</>".length === 3
+                    );
+                    editor.selection = new vscode.Selection(newPosition, newPosition);
+                }
             });
-            
-            vscode.window.showInformationMessage('XML formatted successfully');
-        }  catch (e) {
-            if (e instanceof Error) {
-                vscode.window.showErrorMessage(`Error formatting XML: ${e.message}`);
-            } else {
-                vscode.window.showErrorMessage(`Unknown error formatting XML`);
-            }
         }
+        
     });
 
-    // Format XML helper function
-    function formatXml(xml: string): string {
-        let formatted = '';
-        let indent = '';
-        const tab = '    '; // 4 spaces for indentation
-        let lastOpenTag = '';
-        let inOpenTag = false;
-        
-        xml = xml.replace(/(>)(<)(\/*)/g, '$1\n$2$3'); // Add line breaks
-        
-        xml.split('\n').forEach(line => {
-            line = line.trim();
-            if (!line) return;
-            
-            // Handle comments
-            if (line.startsWith('<!--')) {
-                if (line.endsWith('-->')) {
-                    formatted += indent + line + '\n';
-                } else {
-                    formatted += indent + line;
-                }
-                return;
+    context.subscriptions.push(disposable);
+}
+/**
+ * Find the last opened epsilon tag that needs to be closed
+ * @param textBeforeCursor - Text before cursor position
+ * @param fullText - Full document text
+ * @returns Result containing tagName or message
+ */
+function findLastOpenedEpsilonTag(textBeforeCursor: string, fullText: string): TagResult {
+    // Regular expressions for finding XML epsilon tags
+    // Allowing any XML-valid tag that starts with epsilon or ε
+    const openTagRegex = /<((?:ε|epsilon)[a-zA-Z0-9_:.-]*)(?:\s+[^>]*)?>/gi;
+    const selfClosingTagRegex = /<((?:ε|epsilon)[a-zA-Z0-9_:.-]*)(?:\s+[^>]*)?\s*\/>/gi;
+    const closeTagRegex = /<\/((?:ε|epsilon)[a-zA-Z0-9_:.-]*)>/gi;
+    
+    // Find all open, self-closing, and closing tags
+    const openTags = findAllMatches(textBeforeCursor, openTagRegex);
+    const selfClosingTags = findAllMatches(textBeforeCursor, selfClosingTagRegex);
+    const closeTags = findAllMatches(textBeforeCursor, closeTagRegex);
+    
+    // Filter out self-closing tags from open tags
+    const actualOpenTags = openTags.filter(openTag => {
+        return !selfClosingTags.some(selfClosingTag => 
+            selfClosingTag.index === openTag.index && 
+            selfClosingTag.tag === openTag.tag
+        );
+    });
+    
+    // Create a stack to track open/close tag pairs
+    const tagStack: TagMatch[] = [];
+    
+    // Process tags in order of appearance
+    const allTags = [
+        ...actualOpenTags.map(tag => ({ ...tag, type: 'open' })),
+        ...closeTags.map(tag => ({ ...tag, type: 'close' }))
+    ].sort((a, b) => a.index - b.index);
+    
+    // Build the stack
+    for (const tag of allTags) {
+        if (tag.type === 'open') {
+            tagStack.push(tag);
+        } else if (tag.type === 'close') {
+            // Find matching open tag
+            const matchingOpenIndex = findMatchingOpenTag(tagStack, tag.tag);
+            if (matchingOpenIndex !== -1) {
+                tagStack.splice(matchingOpenIndex, 1);
             }
-            
-            if (line.startsWith('</')) {
-                // Closing tag
-                indent = indent.substring(tab.length);
-                formatted += indent + line + '\n';
-            } else if (line.startsWith('<') && !line.endsWith('/>') && !line.endsWith('>')) {
-                // Open tag that continues on next line
-                inOpenTag = true;
-                lastOpenTag = line;
-                formatted += indent + line + '\n';
-                indent += tab;
-            } else if (inOpenTag && !line.startsWith('<') && !line.endsWith('>')) {
-                // Content inside open tag that spans multiple lines
-                formatted += indent + line + '\n';
-            } else if (inOpenTag && line.endsWith('>')) {
-                // End of open tag
-                inOpenTag = false;
-                formatted += indent + line + '\n';
-            } else if (line.startsWith('<') && !line.endsWith('/>')) {
-                // Normal open tag
-                formatted += indent + line + '\n';
-                indent += tab;
-            } else if (line.startsWith('<') && line.endsWith('/>')) {
-                // Self-closing tag
-                formatted += indent + line + '\n';
-            } else {
-                // Content
-                formatted += indent + line + '\n';
-            }
+        }
+    }
+    
+    // Check if there are any unclosed tags
+    if (tagStack.length > 0) {
+        // Return the most recent unclosed tag
+        return { tagName: tagStack[tagStack.length - 1].tag };
+    }
+    
+    // Check if cursor is inside a CDATA section or comment
+    if (isInXmlSpecialSection(textBeforeCursor)) {
+        return { message: "Cursor is inside a CDATA section or comment" };
+    }
+    
+    // Check if cursor is inside an epsilon tag but not directly after an opening tag
+    const nearestOpenTagMatch = findNearestEpsilonTagContext(textBeforeCursor, fullText);
+    if (nearestOpenTagMatch) {
+        return { tagName: nearestOpenTagMatch };
+    }
+    
+    return { message: "No unclosed XML epsilon tag found" };
+}
+
+/**
+ * Find all matches for a regex pattern in text
+ * @param text - Text to search
+ * @param regex - Regular expression pattern
+ * @returns Array of matches with index and tag name
+ */
+function findAllMatches(text: string, regex: RegExp): TagMatch[] {
+    const matches: TagMatch[] = [];
+    let match: RegExpExecArray | null;
+    
+    while ((match = regex.exec(text)) !== null) {
+        matches.push({
+            index: match.index,
+            tag: match[1]
         });
-        
-        return formatted;
     }
+    
+    return matches;
+}
 
-    // Register snippet commands
-    const snippet1Disposable = vscode.commands.registerCommand('xmlHelper.insertSnippet1', () => {
-        insertXmlSnippet('<example>');
-    });
-
-    const snippet2Disposable = vscode.commands.registerCommand('xmlHelper.insertSnippet2', () => {
-        insertXmlSnippet('<template>\n\t<content>$1</content>\n</template>');
-    });
-
-    // Register custom template commands
-    const insertTemplateDisposable = vscode.commands.registerCommand(
-        'xmlHelper.insertCustomTemplate',
-        async () => {
-            if (customTemplates.length === 0) {
-                const action = await vscode.window.showInformationMessage(
-                    'No custom templates found. Would you like to add one?',
-                    'Yes', 'No'
-                );
-                
-                if (action === 'Yes') {
-                    vscode.commands.executeCommand('xmlHelper.addCustomTemplate');
-                }
-                return;
-            }
-
-            const selected = await vscode.window.showQuickPick(
-                customTemplates.map(t => t.name),
-                { placeHolder: 'Select a template to insert' }
-            );
-
-            if (selected) {
-                const template = customTemplates.find(t => t.name === selected);
-                if (template) {
-                    insertXmlSnippet(template.content);
-                }
-            }
+/**
+ * Find matching open tag in the stack
+ * @param stack - Stack of open tags
+ * @param closeTag - Tag name to match
+ * @returns Index of matching tag or -1
+ */
+function findMatchingOpenTag(stack: TagMatch[], closeTag: string): number {
+    // Look for exact match first (case-insensitive as XML tags are case-sensitive but
+    // we're being permissive with epsilon tag variants)
+    for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].tag.toLowerCase() === closeTag.toLowerCase()) {
+            return i;
         }
-    );
-
-    const addTemplateDisposable = vscode.commands.registerCommand(
-        'xmlHelper.addCustomTemplate',
-        async () => {
-            const name = await vscode.window.showInputBox({
-                prompt: 'Enter template name',
-                validateInput: (value) => {
-                    if (!value || value.trim() === '') {
-                        return 'Template name cannot be empty';
-                    }
-                    if (customTemplates.some(t => t.name === value)) {
-                        return 'Template with this name already exists';
-                    }
-                    return null;
-                }
-            });
-
-            if (!name) { return; }
-
-            const content = await vscode.window.showInputBox({
-                prompt: 'Enter XML content (use $1, $2 for cursor positions)',
-                validateInput: (value) => {
-                    if (!value || value.trim() === '') {
-                        return 'Content cannot be empty';
-                    }
-                    if (!value.includes('<') || !value.includes('>')) {
-                        return 'Content must contain XML tags';
-                    }
-                    return null;
-                }
-            });
-
-            if (!content) { return; }
-
-            // Update configuration
-            customTemplates = [...customTemplates, { name, content }];
-            await config.update('templates', customTemplates, vscode.ConfigurationTarget.Global);
+    }
+    
+    // If no exact match, try matching epsilon prefix variations
+    if (closeTag.toLowerCase().startsWith('ε') || closeTag.toLowerCase().startsWith('epsilon')) {
+        for (let i = stack.length - 1; i >= 0; i--) {
+            const stackTag = stack[i].tag.toLowerCase();
+            const closeTagLower = closeTag.toLowerCase();
             
-            vscode.window.showInformationMessage(`Template "${name}" added successfully`);
-        }
-    );
-
-    // Add all disposables to context
-    context.subscriptions.push(
-        closeTagDisposable,
-        closeAllTagsDisposable,
-        formatXmlDisposable,
-        snippet1Disposable,
-        snippet2Disposable,
-        insertTemplateDisposable,
-        addTemplateDisposable
-    );
-
-    // Helper function to insert XML snippets
-    function insertXmlSnippet(snippet: string) {
-        const editor = vscode.window.activeTextEditor;
-        if (editor) {
-            editor.insertSnippet(new vscode.SnippetString(snippet));
+            // Match epsilon variations (ε vs epsilon prefix)
+            if ((stackTag.startsWith('ε') && closeTagLower.startsWith('epsilon')) ||
+                (stackTag.startsWith('epsilon') && closeTagLower.startsWith('ε'))) {
+                
+                const stackTagNormalized = stackTag.startsWith('ε') ? 
+                    'epsilon' + stackTag.slice(1) : stackTag;
+                    
+                const closeTagNormalized = closeTagLower.startsWith('ε') ? 
+                    'epsilon' + closeTagLower.slice(1) : closeTagLower;
+                    
+                if (stackTagNormalized === closeTagNormalized) {
+                    return i;
+                }
+            }
         }
     }
-
-    // Log activation in console for debugging purposes
-    console.log('XML Helper extension is now fully activated and commands are registered');
-    // Show a notification when the extension is activated
-    vscode.window.showInformationMessage('XML Helper extension is activated');
+    
+    return -1;
 }
 
-export function deactivate() {
-    console.log('XML Helper extension deactivated');
+/**
+ * Check if cursor is inside XML special section (CDATA or comment)
+ * @param textBeforeCursor - Text before cursor position
+ * @returns True if in special section
+ */
+function isInXmlSpecialSection(textBeforeCursor: string): boolean {
+    // Check for unclosed CDATA section
+    const cdataStart = textBeforeCursor.lastIndexOf('<![CDATA[');
+    if (cdataStart !== -1) {
+        const cdataEnd = textBeforeCursor.lastIndexOf(']]>');
+        if (cdataEnd < cdataStart) {
+            return true;
+        }
+    }
+    
+    // Check for unclosed comment
+    const commentStart = textBeforeCursor.lastIndexOf('<!--');
+    if (commentStart !== -1) {
+        const commentEnd = textBeforeCursor.lastIndexOf('-->');
+        if (commentEnd < commentStart) {
+            return true;
+        }
+    }
+    
+    return false;
 }
+
+/**
+ * Find if cursor is inside an epsilon tag context
+ * @param textBeforeCursor - Text before cursor position
+ * @param fullText - Full document text
+ * @returns Tag name if found, null otherwise
+ */
+function findNearestEpsilonTagContext(textBeforeCursor: string, fullText: string): string | null {
+    // Check for partial epsilon tag that might be in progress
+    const partialTagRegex = /<((?:ε|epsilon)[a-zA-Z0-9_:.-]*)(?:\s+[^>]*)?$/;
+    const partialMatch = partialTagRegex.exec(textBeforeCursor);
+    
+    if (partialMatch) {
+        return partialMatch[1];
+    }
+    
+    // XML namespace handling - check if we're in a namespace context
+    const nsRegex = /<([a-zA-Z0-9_.-]+:(?:ε|epsilon)[a-zA-Z0-9_:.-]*)(?:\s+[^>]*)?$/;
+    const nsMatch = nsRegex.exec(textBeforeCursor);
+    
+    if (nsMatch) {
+        return nsMatch[1];
+    }
+    
+    return null;
+}
+
+export function deactivate() {}
